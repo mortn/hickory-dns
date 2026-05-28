@@ -8,7 +8,7 @@
 //! Zone handler with in-memory authoritative data storage
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -353,7 +353,55 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
 
         let answer = inner.inner_lookup(name, query_type, lookup_options);
 
-        // evaluate any cnames for additional inclusion
+        // CNAME chasing: when the answer is a CNAME and the query was for a
+        // different type, restart the lookup at the canonical name and collect
+        // the full chain into the ANSWER section (RFC 1034 §3.6.2).
+        use LookupControlFlow::*;
+        let is_cname_chase = answer.as_ref().is_some_and(|a| {
+            a.record_type() == RecordType::CNAME && query_type != RecordType::CNAME
+        });
+
+        if is_cname_chase {
+            let mut answer_chain: Vec<Arc<RecordSet>> = vec![answer.unwrap()];
+            let mut seen = HashSet::new();
+            seen.insert(name.clone());
+
+            // Cap chain depth to prevent excessive work on pathological zones.
+            const MAX_CNAME_DEPTH: usize = 8;
+
+            loop {
+                if answer_chain.len() >= MAX_CNAME_DEPTH {
+                    break;
+                }
+
+                let last = answer_chain.last().unwrap();
+                let next = maybe_next_name(last, query_type);
+                let Some((next_name, _)) = next else { break };
+
+                if !seen.insert(next_name.clone()) {
+                    break; // loop detection
+                }
+
+                match inner.inner_lookup(&next_name, query_type, lookup_options) {
+                    Some(rr_set) if rr_set.record_type() == RecordType::CNAME => {
+                        // intermediate CNAME, keep chasing
+                        answer_chain.push(rr_set);
+                    }
+                    Some(rr_set) => {
+                        // terminal record (A, AAAA, etc.)
+                        answer_chain.push(rr_set);
+                        break;
+                    }
+                    None => break, // target not in this zone
+                }
+            }
+
+            let answers = LookupRecords::many(lookup_options, answer_chain);
+            return Continue(Ok(AuthLookup::answers(answers, None)));
+        }
+
+        // For non-CNAME answers, evaluate additional section records
+        // (ANAME, MX, SRV, NS).
         let additionals_root_chain_type: Option<(_, _)> = answer
             .as_ref()
             .and_then(|a| maybe_next_name(a, query_type))
@@ -434,7 +482,6 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
         //   always return empty sets. This is only important in the negative case, where other DNS authorities
         //   generally return NoError and no results when other types exist at the same name. bah.
         // TODO: can we get rid of this?
-        use LookupControlFlow::*;
         let answers = match answer {
             Some(rr_set) => LookupRecords::new(lookup_options, rr_set),
             None => {
